@@ -1,4 +1,4 @@
-"""Local web app for downloading YouTube videos.
+"""Local web app for downloading YouTube and Instagram videos.
 
 Run:  python app.py            (opens http://127.0.0.1:8765 in your browser)
       python app.py --no-browser --port 9000
@@ -7,6 +7,7 @@ Run:  python app.py            (opens http://127.0.0.1:8765 in your browser)
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import socket
@@ -25,6 +26,7 @@ from yt_dlp.utils import DownloadCancelled
 import downloader as dl
 
 BASE_DIR = Path(__file__).resolve().parent
+SETTINGS_FILE = BASE_DIR / "settings.json"
 MAX_PARALLEL = 3
 
 app = Flask(__name__, static_folder=str(BASE_DIR / "static"), static_url_path="/static")
@@ -71,6 +73,25 @@ def update(job_id: str, **fields):
     with jobs_lock:
         if job_id in jobs:
             jobs[job_id].update(fields)
+
+
+def load_settings() -> dict:
+    settings = {"cookies_browser": None}
+    try:
+        saved = json.loads(SETTINGS_FILE.read_text())
+        if isinstance(saved, dict):
+            settings.update({k: v for k, v in saved.items() if k in settings})
+    except (OSError, ValueError):
+        pass
+    return settings
+
+
+settings = load_settings()
+
+
+def cookies_browser() -> str | None:
+    browser = settings.get("cookies_browser")
+    return browser if browser in {b["id"] for b in dl.available_browsers()} else None
 
 
 def reveal(path: str):
@@ -124,6 +145,7 @@ def run_job(job_id: str):
                 playlist=playlist,
                 on_progress=on_progress,
                 should_cancel=lambda: jobs[job_id]["_cancel"],
+                cookies_browser=cookies_browser(),
             )
             size = sum(os.path.getsize(f) for f in files if os.path.exists(f))
             update(
@@ -138,7 +160,7 @@ def run_job(job_id: str):
         except DownloadCancelled:
             update(job_id, status="cancelled", finished=time.time())
         except dl.DownloaderError as e:
-            update(job_id, status="error", error=str(e), finished=time.time())
+            update(job_id, status="error", error=str(e), needs_login=e.needs_login, finished=time.time())
         except Exception as e:  # keep the server alive no matter what
             app.logger.exception("Download failed")
             update(job_id, status="error", error=dl.clean_error(e), finished=time.time())
@@ -154,7 +176,26 @@ def index():
 
 @app.get("/api/config")
 def config():
-    return jsonify({"download_dir": str(dl.DEFAULT_DIR), "ffmpeg": dl.HAS_FFMPEG})
+    return jsonify({
+        "download_dir": str(dl.DEFAULT_DIR),
+        "ffmpeg": dl.HAS_FFMPEG,
+        "platform": sys.platform,
+        "browsers": dl.available_browsers(),
+        "cookies_browser": cookies_browser(),
+    })
+
+
+@app.post("/api/settings")
+def save_settings():
+    browser = body().get("cookies_browser") or None
+    if browser is not None and browser not in {b["id"] for b in dl.available_browsers()}:
+        return error("That browser isn't available")
+    settings["cookies_browser"] = browser
+    try:
+        SETTINGS_FILE.write_text(json.dumps(settings, indent=2))
+    except OSError as e:
+        return error(f"Couldn't save settings: {e}", 500)
+    return jsonify({"cookies_browser": browser})
 
 
 @app.post("/api/info")
@@ -163,9 +204,9 @@ def info():
     if not valid_url(url):
         return error("Paste a full link that starts with https://")
     try:
-        return jsonify(dl.fetch_info(url))
+        return jsonify(dl.fetch_info(url, cookies_browser()))
     except dl.DownloaderError as e:
-        return error(str(e), 422)
+        return jsonify({"error": str(e), "needs_login": e.needs_login}), 422
     except Exception as e:
         app.logger.exception("Lookup failed")
         return error(dl.clean_error(e), 500)
@@ -263,7 +304,7 @@ def free_port(start: int) -> int:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="YouTube video downloader (web app)")
+    parser = argparse.ArgumentParser(description="YouTube and Instagram video downloader (web app)")
     parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", 8765)))
     parser.add_argument("--no-browser", action="store_true", help="don't open the browser automatically")
     args = parser.parse_args()

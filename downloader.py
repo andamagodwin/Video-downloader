@@ -1,9 +1,10 @@
-"""Core download logic built on yt-dlp.
+"""Core download logic built on yt-dlp (YouTube, Instagram, and other sites yt-dlp supports).
 
 Used by the web app (app.py) and also runnable on its own as a command-line tool:
 
     python downloader.py "https://www.youtube.com/watch?v=..." -q 720
     python downloader.py "https://www.youtube.com/watch?v=..." -q mp3
+    python downloader.py "https://www.instagram.com/reel/..." --cookies-from-browser chrome
 """
 
 from __future__ import annotations
@@ -18,8 +19,10 @@ import threading
 import time
 from pathlib import Path
 from typing import Callable, Optional
+from urllib.parse import urlparse
 
 import yt_dlp
+from yt_dlp.cookies import SUPPORTED_BROWSERS
 from yt_dlp.utils import DownloadCancelled, DownloadError
 
 DEFAULT_DIR = Path(
@@ -38,6 +41,10 @@ CancelFn = Callable[[], bool]
 
 class DownloaderError(Exception):
     """An error with a message that is safe to show to the user."""
+
+    def __init__(self, message: str, needs_login: bool = False):
+        super().__init__(message)
+        self.needs_login = needs_login
 
 
 def clean_error(err) -> str:
@@ -61,6 +68,100 @@ def quality_label(quality: str) -> str:
     return f"{quality}p video"
 
 
+# ---------------------------------------------------------------- sites and logins
+
+
+def _host(url: str) -> str:
+    host = (urlparse(url).hostname or "").lower()
+    return host[4:] if host.startswith("www.") else host
+
+
+def is_youtube(url: str) -> bool:
+    host = _host(url)
+    return host in ("youtu.be", "youtube.com", "youtube-nocookie.com") or host.endswith(".youtube.com")
+
+
+def site_name(url: str) -> str:
+    host = _host(url)
+    if is_youtube(url):
+        return "YouTube"
+    if host == "instagram.com" or host.endswith(".instagram.com"):
+        return "Instagram"
+    return host or "This site"
+
+
+BROWSER_NAMES = {
+    "chrome": "Chrome", "safari": "Safari", "firefox": "Firefox", "edge": "Edge", "brave": "Brave",
+    "opera": "Opera", "vivaldi": "Vivaldi", "chromium": "Chromium", "whale": "Whale",
+}
+_MAC_APPS = {
+    "chrome": "Google Chrome", "safari": "Safari", "firefox": "Firefox", "edge": "Microsoft Edge",
+    "brave": "Brave Browser", "opera": "Opera", "vivaldi": "Vivaldi", "chromium": "Chromium", "whale": "Whale",
+}
+
+
+def available_browsers() -> list[dict]:
+    """Browsers whose logins yt-dlp can use (on macOS, only the ones that are installed)."""
+    found = []
+    for key, name in BROWSER_NAMES.items():
+        if key not in SUPPORTED_BROWSERS:
+            continue
+        if sys.platform == "darwin":
+            app = f"{_MAC_APPS[key]}.app"
+            if not any((d / app).exists() for d in (Path("/Applications"), Path.home() / "Applications")):
+                continue
+        elif key == "safari":
+            continue
+        found.append({"id": key, "name": name})
+    return found
+
+
+_LOGIN_HINTS = (
+    "login required", "log in", "logged-in", "logged in", "empty media response", "rate-limit",
+    "--cookies", "cookies-from-browser", "this content is unreachable", "private",
+)
+
+
+def explain_error(msg: str, url: str, cookies_browser: Optional[str]) -> DownloaderError:
+    """Swap yt-dlp's command-line advice for something that makes sense in this app."""
+    low = msg.lower()
+    browser = BROWSER_NAMES.get(cookies_browser or "", cookies_browser)
+    if "no video formats found" in low:
+        return DownloaderError("There's no video here. Photos can't be downloaded, only videos.")
+    if is_youtube(url) and "not a bot" in low:
+        return DownloaderError(
+            "YouTube wants to confirm you're not a bot. Wait a few minutes and try again, "
+            "or restart the app so it can update."
+        )
+    if cookies_browser and ("operation not permitted" in low or "permission denied" in low):
+        return DownloaderError(
+            f"macOS blocked access to {browser}'s login data. Give your Terminal app Full Disk Access "
+            "(System Settings → Privacy & Security → Full Disk Access) or choose another browser in Settings.",
+            needs_login=True,
+        )
+    if cookies_browser and "could not find" in low and "cookies" in low:
+        return DownloaderError(
+            f"Couldn't find {browser}'s login data. Open {browser}, log in to the site, then try again "
+            "— or choose another browser in Settings.",
+            needs_login=True,
+        )
+    # Browser logins are never used for YouTube, so login advice only makes sense elsewhere.
+    if not is_youtube(url) and any(hint in low for hint in _LOGIN_HINTS):
+        site = site_name(url)
+        if cookies_browser:
+            return DownloaderError(
+                f"{site} wouldn't share this, even with your {browser} login. Check that you're logged in to "
+                f"{site} in {browser} and that the link opens there.",
+                needs_login=True,
+            )
+        return DownloaderError(
+            f"{site} only shows this to logged-in users, or is limiting logged-out downloads right now. "
+            "Turn on “Use my browser’s login” in Settings, then try again.",
+            needs_login=True,
+        )
+    return DownloaderError(msg)
+
+
 class _Logger:
     """Collects yt-dlp's warnings and errors instead of printing them."""
 
@@ -81,8 +182,8 @@ class _Logger:
         self.errors.append(clean_error(msg))
 
 
-def _base_opts(logger: _Logger) -> dict:
-    return {
+def _base_opts(logger: _Logger, url: str, cookies_browser: Optional[str]) -> dict:
+    opts = {
         "logger": logger,
         "quiet": True,
         "noprogress": True,
@@ -92,6 +193,11 @@ def _base_opts(logger: _Logger) -> dict:
         # A watch link that also carries &list=... downloads only that video.
         "noplaylist": True,
     }
+    # Use the browser's login (cookies) for sites like Instagram, but never for YouTube:
+    # yt-dlp warns that using a Google account with it can get the account flagged.
+    if cookies_browser and not is_youtube(url):
+        opts["cookiesfrombrowser"] = (cookies_browser,)
+    return opts
 
 
 # Looking a video up takes several seconds (YouTube's player challenge has to be solved),
@@ -133,26 +239,32 @@ def _resolution(fmt: dict) -> Optional[int]:
     return min(sides) if sides else None
 
 
-def fetch_info(url: str) -> dict:
-    """Look up a video or playlist without downloading it."""
+def fetch_info(url: str, cookies_browser: Optional[str] = None) -> dict:
+    """Look up a video or playlist (or an Instagram post with several videos) without downloading it."""
     logger = _Logger()
-    opts = {**_base_opts(logger), "skip_download": True, "extract_flat": "in_playlist"}
+    opts = {**_base_opts(logger, url, cookies_browser), "skip_download": True, "extract_flat": "in_playlist"}
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False)
             if info:
                 info = ydl.sanitize_info(info)
     except DownloadError as e:
-        raise DownloaderError(clean_error(e)) from None
+        raise explain_error(clean_error(e), url, cookies_browser) from None
+    except Exception as e:  # e.g. the browser's login data couldn't be read
+        raise explain_error(clean_error(e), url, cookies_browser) from None
     if not info:
-        raise DownloaderError(logger.errors[-1] if logger.errors else "Could not read that link")
+        raise explain_error(logger.errors[-1] if logger.errors else "Could not read that link", url, cookies_browser)
     if info.get("_type") != "playlist":  # playlists are cheap to look up; their videos aren't fetched yet
         _cache_put((url, info.get("webpage_url")), info)
 
+    site = site_name(url)
     if info.get("_type") == "playlist":
         entries = [e for e in info.get("entries") or [] if e]
+        if not entries and not info.get("playlist_count"):
+            raise explain_error("Nothing to download here: no videos found (it may be private)", url, cookies_browser)
         return {
             "type": "playlist",
+            "site": site,
             "url": url,
             "title": info.get("title") or "Playlist",
             "uploader": info.get("uploader") or info.get("channel"),
@@ -171,6 +283,7 @@ def fetch_info(url: str) -> dict:
     )
     return {
         "type": "video",
+        "site": site,
         "url": info.get("webpage_url") or url,
         "id": info.get("id"),
         "title": info.get("title") or "Untitled",
@@ -183,8 +296,10 @@ def fetch_info(url: str) -> dict:
     }
 
 
-def build_opts(quality: str, out_dir: Path, playlist: bool, logger: _Logger) -> dict:
-    opts = _base_opts(logger)
+def build_opts(
+    quality: str, out_dir: Path, playlist: bool, logger: _Logger, url: str = "", cookies_browser: Optional[str] = None
+) -> dict:
+    opts = _base_opts(logger, url, cookies_browser)
     # Put the resolution in video names so a 720p copy doesn't count as "already downloaded"
     # when a 1080p copy of the same video exists.
     res_tag = f" ({quality}p)" if quality.isdigit() else ""
@@ -240,8 +355,9 @@ def download(
     playlist: bool = False,
     on_progress: Optional[ProgressFn] = None,
     should_cancel: Optional[CancelFn] = None,
+    cookies_browser: Optional[str] = None,
 ) -> list[str]:
-    """Download a video (or every video in a playlist). Returns the saved file paths."""
+    """Download a video (or every video in a playlist or post). Returns the saved file paths."""
     if not is_valid_quality(quality):
         raise DownloaderError(f"Unknown quality: {quality}")
     out_dir = Path(out_dir).expanduser()
@@ -293,7 +409,7 @@ def download(
             if path and path not in files:
                 files.append(path)
 
-    opts = build_opts(quality, out_dir, playlist, logger)
+    opts = build_opts(quality, out_dir, playlist, logger, url, cookies_browser)
     opts["progress_hooks"] = [progress_hook]
     opts["postprocessor_hooks"] = [postprocessor_hook]
 
@@ -319,7 +435,9 @@ def download(
                         pass
         raise
     except DownloadError as e:
-        raise DownloaderError(clean_error(e)) from None
+        raise explain_error(clean_error(e), url, cookies_browser) from None
+    except Exception as e:  # e.g. the browser's login data couldn't be read
+        raise explain_error(clean_error(e), url, cookies_browser) from None
 
     # Fall back to yt-dlp's own record of what it saved (e.g. files that already existed).
     entries = (result or {}).get("entries") if (result or {}).get("_type") == "playlist" else [result]
@@ -331,7 +449,7 @@ def download(
 
     files = [f for f in files if os.path.exists(f)]
     if not files:
-        raise DownloaderError(logger.errors[-1] if logger.errors else "Nothing was downloaded")
+        raise explain_error(logger.errors[-1] if logger.errors else "Nothing was downloaded", url, cookies_browser)
     return files
 
 
@@ -349,25 +467,30 @@ def _fmt_bytes(n) -> str:
 
 
 def main(argv=None) -> int:
-    parser = argparse.ArgumentParser(description="Download YouTube videos or audio.")
-    parser.add_argument("url", help="video or playlist link")
+    parser = argparse.ArgumentParser(description="Download YouTube or Instagram videos, or their audio.")
+    parser.add_argument("url", help="video, playlist, reel or post link")
     parser.add_argument(
         "-q", "--quality", default="best",
         help="best (default), a resolution like 1080 / 720 / 480, or mp3 / m4a for audio only",
     )
     parser.add_argument("-o", "--output", default=str(DEFAULT_DIR), help=f"folder to save into (default: {DEFAULT_DIR})")
+    parser.add_argument(
+        "--cookies-from-browser", metavar="BROWSER", choices=sorted(SUPPORTED_BROWSERS),
+        help="use your login from this browser for sites like Instagram (never used for YouTube)",
+    )
     args = parser.parse_args(argv)
+    browser = args.cookies_from_browser
 
     if not is_valid_quality(args.quality):
         parser.error("quality must be best, a number like 720, mp3 or m4a")
 
     try:
         print("Looking up link…")
-        info = fetch_info(args.url)
+        info = fetch_info(args.url, browser)
         if info["type"] == "playlist":
-            print(f"Playlist: {info['title']} ({info['count']} videos)")
+            print(f"{info['site']} {'post' if info['site'] == 'Instagram' else 'playlist'}: {info['title']} ({info['count']} videos)")
         else:
-            print(f"Video: {info['title']}")
+            print(f"{info['site']} video: {info['title']}")
         print(f"Format: {quality_label(args.quality)}  →  {args.output}")
 
         def show(p):
@@ -381,7 +504,9 @@ def main(argv=None) -> int:
             else:
                 print(f"\r  {p['step']}…{'':<70}", end="", flush=True)
 
-        files = download(args.url, args.quality, Path(args.output), info["type"] == "playlist", show)
+        files = download(
+            args.url, args.quality, Path(args.output), info["type"] == "playlist", show, cookies_browser=browser
+        )
         print()
         for f in files:
             print(f"Saved: {f}")

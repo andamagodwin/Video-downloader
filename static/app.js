@@ -25,6 +25,11 @@ const els = {
   clear: $('#clear-btn'),
   openFolder: $('#open-folder'),
   jobTpl: $('#job-tpl'),
+  settingsBtn: $('#settings-btn'),
+  settings: $('#settings'),
+  cookies: $('#cookies-browser'),
+  settingsSaved: $('#settings-saved'),
+  settingsHint: $('#settings-hint'),
 };
 
 let config = { ffmpeg: true, download_dir: '' };
@@ -43,7 +48,11 @@ async function api(path, { method = 'GET', data } = {}) {
   });
   let payload = null;
   try { payload = await res.json(); } catch { /* no body */ }
-  if (!res.ok) throw new Error((payload && payload.error) || `Request failed (${res.status})`);
+  if (!res.ok) {
+    const err = new Error((payload && payload.error) || `Request failed (${res.status})`);
+    err.needsLogin = Boolean(payload && payload.needs_login);
+    throw err;
+  }
   return payload;
 }
 
@@ -79,10 +88,13 @@ function looksLikeUrl(text) {
   return /^https?:\/\/\S+\.\S+/i.test(text.trim());
 }
 
-function showMsg(text, kind = '') {
+function showMsg(text, kind = '', action = null) {
   els.msg.textContent = text;
   els.msg.className = `form-msg ${kind}`;
+  if (action) els.msg.append(button(action.label, action.onClick));
 }
+
+const loginAction = () => ({ label: 'Open settings', onClick: openSettingsForLogin });
 
 function button(label, onClick, cls = 'btn ghost small') {
   const b = document.createElement('button');
@@ -115,7 +127,7 @@ async function lookup() {
   } catch (err) {
     if (seq !== lookupSeq) return;
     els.preview.hidden = true;
-    showMsg(err.message, 'error');
+    showMsg(err.message, 'error', err.needsLogin ? loginAction() : null);
   } finally {
     if (seq === lookupSeq) {
       els.fetchBtn.classList.remove('busy');
@@ -167,9 +179,12 @@ function renderPreview(info) {
   els.duration.textContent = info.duration ? fmtDuration(info.duration) : '';
   els.title.textContent = info.title;
 
+  const isInstagram = info.site === 'Instagram';
+  const groupName = !isInstagram ? 'Playlist' : /\/stories\//.test(info.url) ? 'Stories' : 'Post';
   const meta = [];
-  if (info.type === 'playlist') meta.push(`Playlist · ${info.count ?? '?'} videos`);
-  if (info.uploader) meta.push(info.uploader);
+  if (info.site && info.site !== 'YouTube') meta.push(info.site);
+  if (info.type === 'playlist') meta.push(`${groupName} · ${info.count ?? '?'} videos`);
+  if (info.uploader && info.uploader !== info.site) meta.push(info.uploader);
   if (info.views) meta.push(`${compact.format(info.views)} views`);
   els.meta.textContent = meta.join(' · ');
 
@@ -184,7 +199,11 @@ function renderPreview(info) {
 
   let note = '';
   if (info.is_live) note = 'This is a live stream. It can be downloaded once the broadcast has ended.';
-  else if (info.type === 'playlist') note = 'Every video in the playlist is saved into its own folder. If a resolution isn’t available, the closest one is used.';
+  else if (info.type === 'playlist') {
+    note = isInstagram
+      ? `All ${info.count ?? ''} videos are saved together in one folder. If a resolution isn’t available, the closest one is used.`
+      : 'Every video in the playlist is saved into its own folder. If a resolution isn’t available, the closest one is used.';
+  }
   else if (!config.ffmpeg) note = 'ffmpeg isn’t installed, so only lower-quality single-file video is available. Install it with: brew install ffmpeg';
   els.note.textContent = note;
   els.note.hidden = !note;
@@ -307,7 +326,9 @@ function createJobEl(job) {
   if (job.thumbnail) img.src = job.thumbnail; else img.remove();
   el.querySelector('.job-title').textContent = job.title;
   el.querySelector('.job-title').title = job.title;
-  el.querySelector('.tag').textContent = job.playlist ? `${job.quality_label} · playlist` : job.quality_label;
+  el.querySelector('.tag').textContent = job.playlist
+    ? `${job.quality_label} · ${job.count ? `${job.count} videos` : 'playlist'}`
+    : job.quality_label;
   return el;
 }
 
@@ -330,6 +351,7 @@ function updateJobEl(el, job) {
     actions.replaceChildren();
     if (actionKey === 'active') actions.append(button('Cancel', () => jobAction(`/api/downloads/${job.id}/cancel`)));
     if (actionKey === 'done') actions.append(button(IS_MAC ? 'Show in Finder' : 'Show in folder', () => jobAction(`/api/downloads/${job.id}/reveal`)));
+    if (actionKey === 'error' && job.needs_login) actions.append(button('Settings', openSettingsForLogin));
     if (actionKey === 'error' || actionKey === 'cancelled') actions.append(button('Try again', () => retry(job)));
   }
   el.dataset.status = job.status;
@@ -368,6 +390,76 @@ async function refreshJobs() {
   if (active) pollTimer = setTimeout(refreshJobs, 800);
 }
 
+// ------------------------------------------------------------------ settings
+
+const CHROMIUM_KEYCHAIN = {
+  chrome: 'Chrome', edge: 'Microsoft Edge', brave: 'Brave', opera: 'Opera',
+  vivaldi: 'Vivaldi', chromium: 'Chromium', whale: 'Whale',
+};
+
+function browserHint(id) {
+  if (!id || config.platform !== 'darwin') return '';
+  if (id === 'safari') {
+    return 'macOS protects Safari’s data. If downloads still say you need to log in, give your Terminal app '
+      + 'Full Disk Access (System Settings → Privacy & Security → Full Disk Access) and restart this app.';
+  }
+  if (CHROMIUM_KEYCHAIN[id]) {
+    return `The first time it’s used, macOS asks for permission to use “${CHROMIUM_KEYCHAIN[id]} Safe Storage”. `
+      + 'Enter your Mac password and choose Always Allow.';
+  }
+  return '';
+}
+
+function renderSettings() {
+  const choices = [{ id: '', name: 'Off' }, ...(config.browsers || [])];
+  els.cookies.replaceChildren(...choices.map((b) => {
+    const option = document.createElement('option');
+    option.value = b.id;
+    option.textContent = b.name;
+    return option;
+  }));
+  els.cookies.value = config.cookies_browser || '';
+  updateHint();
+}
+
+function updateHint() {
+  const hint = browserHint(els.cookies.value);
+  els.settingsHint.textContent = hint;
+  els.settingsHint.hidden = !hint;
+}
+
+function toggleSettings(open = els.settings.hidden) {
+  els.settings.hidden = !open;
+  els.settingsBtn.setAttribute('aria-expanded', String(open));
+}
+
+function openSettingsForLogin() {
+  toggleSettings(true);
+  els.settings.classList.remove('flash');
+  void els.settings.offsetWidth; // restart the highlight animation
+  els.settings.classList.add('flash');
+  setTimeout(() => els.settings.classList.remove('flash'), 1600);
+  els.settings.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  els.cookies.focus();
+}
+
+els.settingsBtn.addEventListener('click', () => toggleSettings());
+
+els.cookies.addEventListener('change', async () => {
+  els.settingsSaved.textContent = '';
+  updateHint();
+  try {
+    const res = await api('/api/settings', { method: 'POST', data: { cookies_browser: els.cookies.value || null } });
+    config.cookies_browser = res.cookies_browser;
+    els.settingsSaved.textContent = 'Saved';
+    setTimeout(() => { els.settingsSaved.textContent = ''; }, 2000);
+  } catch (err) {
+    els.cookies.value = config.cookies_browser || '';
+    updateHint();
+    showMsg(err.message, 'error');
+  }
+});
+
 // ------------------------------------------------------------------ events
 
 els.form.addEventListener('submit', (e) => { e.preventDefault(); lookup(); });
@@ -394,6 +486,7 @@ document.addEventListener('visibilitychange', () => { if (!document.hidden) refr
     config = await api('/api/config');
     els.dir.textContent = config.download_dir;
   } catch { /* keep defaults */ }
+  renderSettings();
   refreshJobs();
 
   // Support links like http://127.0.0.1:8765/?url=https://youtube.com/watch?v=… (e.g. from a bookmarklet)

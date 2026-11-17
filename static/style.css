@@ -75,6 +75,33 @@ body {
 
 h1 { margin: 0; font-size: 22px; line-height: 1.2; letter-spacing: -0.01em; }
 .tagline { margin: 2px 0 0; color: var(--muted); }
+.brand-text { flex: 1; min-width: 0; }
+.settings-btn { flex: none; align-self: flex-start; margin-top: 4px; }
+.settings-btn[aria-expanded="true"] { background: var(--surface-2); }
+
+/* ---------------------------------------------------------------- settings */
+
+.settings { padding: 16px 18px; margin: -10px 0 20px; animation: rise .2s ease-out; }
+.settings[hidden] { display: none; }
+.setting { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; }
+.setting-title { display: block; font-weight: 650; }
+.setting-help { margin: 2px 0 0; font-size: 13.5px; color: var(--muted); max-width: 52ch; }
+.setting-control { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; flex: none; }
+.setting-control select {
+  height: 36px; min-width: 150px; padding: 0 10px;
+  border: 1px solid var(--border); border-radius: 9px;
+  background: var(--surface); color: var(--text);
+  font: inherit; font-size: 14px;
+}
+.setting-control select:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.saved { min-height: 18px; font-size: 12.5px; color: var(--success); }
+.setting-hint {
+  margin: 12px 0 0; padding: 10px 12px;
+  border-radius: 10px; background: var(--surface-2);
+  font-size: 13px; color: var(--text);
+}
+.setting-hint[hidden] { display: none; }
+.settings.flash { box-shadow: 0 0 0 3px var(--accent-soft), var(--shadow); border-color: var(--accent); }
 
 /* ---------------------------------------------------------------- buttons */
 
@@ -132,6 +159,7 @@ h1 { margin: 0; font-size: 22px; line-height: 1.2; letter-spacing: -0.01em; }
 
 .form-msg { min-height: 22px; margin: 8px 2px 0; font-size: 14px; color: var(--muted); }
 .form-msg.error { color: var(--danger); }
+.form-msg .btn { margin-left: 8px; vertical-align: middle; color: var(--text); }
 
 /* ---------------------------------------------------------------- preview */
 
@@ -345,6 +373,9 @@ footer { margin-top: 44px; text-align: center; font-size: 12.5px; color: var(--m
 
 @media (max-width: 600px) {
   .wrap { padding: 32px 16px 40px; }
+  .settings-btn span { display: none; }
+  .setting { flex-direction: column; gap: 12px; }
+  .setting-control { align-items: stretch; width: 100%; }
   .search { flex-direction: column; }
   .search input { flex: none; width: 100%; }
   .search .btn { width: 100%; }

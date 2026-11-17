@@ -13,16 +13,39 @@
       <div class="logo" aria-hidden="true">
         <svg viewBox="0 0 24 24" width="24" height="24"><path d="M12 4v11m0 0-4.5-4.5M12 15l4.5-4.5M6 19.5h12" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
       </div>
-      <div>
+      <div class="brand-text">
         <h1>Video Downloader</h1>
-        <p class="tagline">Paste a YouTube link and save it as video or audio.</p>
+        <p class="tagline">Paste a YouTube or Instagram link and save it as video or audio.</p>
       </div>
+      <button id="settings-btn" type="button" class="btn ghost small settings-btn" aria-label="Settings" aria-expanded="false" aria-controls="settings">
+        <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path d="M4 7h10m4 0h2M4 17h4m4 0h8" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="16" cy="7" r="2.2" fill="none" stroke="currentColor" stroke-width="2"/><circle cx="10" cy="17" r="2.2" fill="none" stroke="currentColor" stroke-width="2"/></svg>
+        <span>Settings</span>
+      </button>
     </header>
 
+    <section id="settings" class="card settings" hidden aria-labelledby="settings-title">
+      <h2 id="settings-title" class="sr-only">Settings</h2>
+      <div class="setting">
+        <div class="setting-text">
+          <label for="cookies-browser" class="setting-title">Use my browser’s login</label>
+          <p class="setting-help">
+            For Instagram posts from private accounts, and for when Instagram blocks logged-out downloads.
+            Your login is read on this computer and only sent to the site you’re downloading from.
+            It is never used for YouTube.
+          </p>
+        </div>
+        <div class="setting-control">
+          <select id="cookies-browser"></select>
+          <span id="settings-saved" class="saved" role="status" aria-live="polite"></span>
+        </div>
+      </div>
+      <p id="settings-hint" class="setting-hint" hidden></p>
+    </section>
+
     <form id="url-form" class="search" autocomplete="off" novalidate>
-      <label for="url" class="sr-only">YouTube link</label>
+      <label for="url" class="sr-only">Video link</label>
       <input id="url" type="url" inputmode="url" spellcheck="false"
-             placeholder="https://www.youtube.com/watch?v=…" aria-describedby="form-msg">
+             placeholder="Paste a YouTube or Instagram link" aria-describedby="form-msg">
       <button id="fetch-btn" type="submit" class="btn primary">Get video</button>
     </form>
     <p id="form-msg" class="form-msg" role="status" aria-live="polite"></p>

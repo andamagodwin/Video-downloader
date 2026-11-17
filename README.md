@@ -1,7 +1,7 @@
 # Video Downloader
 
-A small app that runs on your computer for downloading YouTube videos as MP4 video or MP3/M4A audio.
-Paste a link, pick a quality, and the file is saved to `~/Downloads/Video Downloader`.
+A small app that runs on your computer for downloading **YouTube** and **Instagram** videos as MP4 video
+or MP3/M4A audio. Paste a link, pick a quality, and the file is saved to `~/Downloads/Video Downloader`.
 
 Built on [yt-dlp](https://github.com/yt-dlp/yt-dlp), with a Flask server and a plain HTML/JS page.
 
@@ -31,13 +31,35 @@ window) to stop.
 - **Audio only:** MP3 (192 kbps) or M4A, with title, artist and cover art embedded.
 - **Playlists:** paste a playlist link to download every video into its own folder, numbered in order.
   Private or removed videos are skipped.
+- **Instagram:** reels, video posts, and posts with several videos (saved together in one folder).
+  Story highlights work too. See [Instagram](#instagram) below.
 - **Downloads list:** shows progress, speed and time left. Up to 3 downloads run at once and the rest wait
   in a queue. Each finished download has a button to show it in Finder.
 - Remembers the quality you picked last time.
 
+## Instagram
+
+Public reels and posts download without logging in. Instagram hides some content from logged-out visitors
+(private accounts you follow, some stories), and sometimes blocks logged-out downloads for a while. For
+those, open **Settings** and turn on **Use my browser's login**, choosing a browser where you're logged in
+to Instagram.
+
+- Your login (the browser's cookies) is read on your computer and only sent to the site you're downloading
+  from. It is **never used for YouTube**, because yt-dlp warns that using a Google account with it can get
+  that account flagged.
+- **Chrome, Edge, Brave and similar browsers:** the first time, macOS asks for permission to use
+  "Chrome Safe Storage" (or the equivalent for your browser). Enter your Mac password and choose
+  **Always Allow**.
+- **Safari:** macOS protects Safari's data, so your Terminal app needs **Full Disk Access**
+  (System Settings → Privacy & Security → Full Disk Access).
+- Photo-only posts can't be downloaded, only videos.
+
+The setting is saved in `settings.json` in this folder, which is not committed to git.
+
 ### Bookmarklet (optional)
 
-To open the video you're watching straight in the downloader, create a browser bookmark with this as the URL:
+To open the video you're watching (on YouTube or Instagram) straight in the downloader, create a browser
+bookmark with this as the URL:
 
 ```
 javascript:location='http://127.0.0.1:8765/?url='+encodeURIComponent(location.href)
@@ -52,6 +74,8 @@ The same downloader works without the browser:
 .venv/bin/python downloader.py "https://www.youtube.com/watch?v=..." -q 720     # 720p
 .venv/bin/python downloader.py "https://www.youtube.com/watch?v=..." -q mp3     # audio
 .venv/bin/python downloader.py "https://www.youtube.com/watch?v=..." -o ~/Movies
+.venv/bin/python downloader.py "https://www.instagram.com/reel/..."                # Instagram reel
+.venv/bin/python downloader.py "https://www.instagram.com/p/..." --cookies-from-browser chrome
 ```
 
 ## Settings
@@ -65,8 +89,10 @@ Example: `DOWNLOAD_DIR=~/Movies ./start.sh`
 
 ## Troubleshooting
 
-- **"Sign in to confirm you're not a bot" or other YouTube errors:** restart the app so it updates yt-dlp.
+- **"Confirm you're not a bot" or other YouTube errors:** restart the app so it updates yt-dlp.
   YouTube changes often, and fixes usually arrive within days.
+- **"Instagram only shows this to logged-in users":** turn on **Use my browser's login** in Settings
+  (see [Instagram](#instagram)). If it's already on, check you're logged in to Instagram in that browser.
 - **MP3 or HD options are missing:** install ffmpeg (`brew install ffmpeg`) and restart.
 - **Port already in use:** the app automatically tries the next free port. Check the address printed in the Terminal.
 
@@ -85,4 +111,4 @@ requests that come from other websites.
 ---
 
 Only download videos you own, that are freely licensed, or that you otherwise have permission to save.
-Downloading may go against YouTube's Terms of Service.
+Downloading may go against YouTube's and Instagram's Terms of Service.
