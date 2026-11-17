@@ -23,6 +23,17 @@ window) to stop.
 - **ffmpeg**, needed to merge HD video with its audio and to make MP3s: `brew install ffmpeg`
 - **Node.js** or **Deno**, which YouTube now requires for solving its player challenges: `brew install node`
 
+### Can I put it online (Vercel, Netlify, Render…)?
+
+No. It's built to run on your own computer, and it won't work as a hosted website. If it is deployed to a
+host like Vercel, every page shows a "runs on your own computer" notice instead of the app. The reasons:
+
+- Serverless hosts such as Vercel run code only while answering a request, so background downloads get cut
+  off. Vercel also can't send responses larger than 4.5 MB, which rules out sending video files.
+- Files are saved on the computer running the app. On a host, that's the host's server, not yours.
+- ffmpeg and Node.js, which HD video, MP3 and YouTube depend on, aren't available on those hosts.
+- YouTube and Instagram block downloads from cloud servers, with errors like "confirm you're not a bot".
+
 ## What it does
 
 - **Video:** every resolution the video offers, from 144p up to 4K, saved as MP4. At 1080p and below
