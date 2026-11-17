@@ -1,0 +1,398 @@
+"""Core download logic built on yt-dlp.
+
+Used by the web app (app.py) and also runnable on its own as a command-line tool:
+
+    python downloader.py "https://www.youtube.com/watch?v=..." -q 720
+    python downloader.py "https://www.youtube.com/watch?v=..." -q mp3
+"""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import os
+import re
+import shutil
+import sys
+import threading
+import time
+from pathlib import Path
+from typing import Callable, Optional
+
+import yt_dlp
+from yt_dlp.utils import DownloadCancelled, DownloadError
+
+DEFAULT_DIR = Path(
+    os.environ.get("DOWNLOAD_DIR") or Path.home() / "Downloads" / "Video Downloader"
+).expanduser()
+
+AUDIO_FORMATS = ("mp3", "m4a")
+PLAYLIST_HEIGHTS = [1080, 720, 480, 360]
+HAS_FFMPEG = shutil.which("ffmpeg") is not None
+
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+ProgressFn = Callable[[dict], None]
+CancelFn = Callable[[], bool]
+
+
+class DownloaderError(Exception):
+    """An error with a message that is safe to show to the user."""
+
+
+def clean_error(err) -> str:
+    """Turn a yt-dlp error into a short, readable message."""
+    msg = _ANSI.sub("", str(err)).strip()
+    msg = re.sub(r"^(ERROR|WARNING):\s*", "", msg)
+    msg = re.sub(r"^\[[\w:]+\]\s*[\w-]+:\s*", "", msg)  # "[youtube] abc123: ..."
+    msg = msg.split("; please report this issue")[0]
+    return msg or "Something went wrong"
+
+
+def is_valid_quality(quality: str) -> bool:
+    return quality == "best" or quality in AUDIO_FORMATS or (quality.isdigit() and 100 <= int(quality) <= 4320)
+
+
+def quality_label(quality: str) -> str:
+    if quality in AUDIO_FORMATS:
+        return f"{quality.upper()} audio"
+    if quality == "best":
+        return "Best quality"
+    return f"{quality}p video"
+
+
+class _Logger:
+    """Collects yt-dlp's warnings and errors instead of printing them."""
+
+    def __init__(self):
+        self.errors: list[str] = []
+        self.warnings: list[str] = []
+
+    def debug(self, msg):
+        pass
+
+    def info(self, msg):
+        pass
+
+    def warning(self, msg):
+        self.warnings.append(clean_error(msg))
+
+    def error(self, msg):
+        self.errors.append(clean_error(msg))
+
+
+def _base_opts(logger: _Logger) -> dict:
+    return {
+        "logger": logger,
+        "quiet": True,
+        "noprogress": True,
+        # YouTube needs a JavaScript runtime to solve its player challenges.
+        # Deno is preferred if installed, otherwise Node.js is used.
+        "js_runtimes": {"deno": {}, "node": {}},
+        # A watch link that also carries &list=... downloads only that video.
+        "noplaylist": True,
+    }
+
+
+# Looking a video up takes several seconds (YouTube's player challenge has to be solved),
+# so the result of fetch_info() is kept briefly and reused when the download starts.
+_CACHE_TTL = 20 * 60
+_cache: dict[str, tuple[float, dict]] = {}
+_cache_lock = threading.Lock()
+
+
+def _cache_put(keys, info: dict):
+    now = time.time()
+    with _cache_lock:
+        for url, (stamp, _) in list(_cache.items()):
+            if now - stamp > _CACHE_TTL:
+                del _cache[url]
+        for key in keys:
+            if key:
+                _cache[key] = (now, info)
+
+
+def _cache_get(url: str) -> Optional[dict]:
+    with _cache_lock:
+        entry = _cache.get(url)
+    if entry and time.time() - entry[0] < _CACHE_TTL:
+        return copy.deepcopy(entry[1])  # yt-dlp modifies the dict while downloading
+    return None
+
+
+def _thumbnail(info: dict) -> Optional[str]:
+    if info.get("thumbnail"):
+        return info["thumbnail"]
+    thumbs = [t for t in info.get("thumbnails") or [] if t.get("url")]
+    return thumbs[-1]["url"] if thumbs else None
+
+
+def _resolution(fmt: dict) -> Optional[int]:
+    """The "p" number of a format: its shorter side, so vertical videos read as 1080p, not 1920p."""
+    sides = [s for s in (fmt.get("width"), fmt.get("height")) if s]
+    return min(sides) if sides else None
+
+
+def fetch_info(url: str) -> dict:
+    """Look up a video or playlist without downloading it."""
+    logger = _Logger()
+    opts = {**_base_opts(logger), "skip_download": True, "extract_flat": "in_playlist"}
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            if info:
+                info = ydl.sanitize_info(info)
+    except DownloadError as e:
+        raise DownloaderError(clean_error(e)) from None
+    if not info:
+        raise DownloaderError(logger.errors[-1] if logger.errors else "Could not read that link")
+    if info.get("_type") != "playlist":  # playlists are cheap to look up; their videos aren't fetched yet
+        _cache_put((url, info.get("webpage_url")), info)
+
+    if info.get("_type") == "playlist":
+        entries = [e for e in info.get("entries") or [] if e]
+        return {
+            "type": "playlist",
+            "url": url,
+            "title": info.get("title") or "Playlist",
+            "uploader": info.get("uploader") or info.get("channel"),
+            "count": len(entries) or info.get("playlist_count"),
+            "thumbnail": _thumbnail(info) or (entries and _thumbnail(entries[0])) or None,
+            "heights": PLAYLIST_HEIGHTS,
+        }
+
+    heights = sorted(
+        {
+            r
+            for f in info.get("formats") or []
+            if f.get("vcodec") != "none" and (r := _resolution(f)) and r >= 144
+        },
+        reverse=True,
+    )
+    return {
+        "type": "video",
+        "url": info.get("webpage_url") or url,
+        "id": info.get("id"),
+        "title": info.get("title") or "Untitled",
+        "uploader": info.get("uploader") or info.get("channel"),
+        "duration": info.get("duration"),
+        "views": info.get("view_count"),
+        "thumbnail": _thumbnail(info),
+        "is_live": bool(info.get("is_live")),
+        "heights": heights,
+    }
+
+
+def build_opts(quality: str, out_dir: Path, playlist: bool, logger: _Logger) -> dict:
+    opts = _base_opts(logger)
+    # Put the resolution in video names so a 720p copy doesn't count as "already downloaded"
+    # when a 1080p copy of the same video exists.
+    res_tag = f" ({quality}p)" if quality.isdigit() else ""
+    name = f"%(title).150B{res_tag} [%(id)s].%(ext)s"
+    if playlist:
+        name = "%(playlist_title).100B/%(playlist_index)03d - " + name
+        opts["noplaylist"] = False
+        opts["ignoreerrors"] = True  # skip private/removed videos instead of stopping
+    opts["outtmpl"] = {"default": str(out_dir / name)}
+    opts["windowsfilenames"] = True  # avoid characters that break on other systems
+
+    postprocessors = []
+    if quality in AUDIO_FORMATS:
+        if not HAS_FFMPEG:
+            raise DownloaderError("ffmpeg is required to convert audio. Install it with: brew install ffmpeg")
+        opts["format"] = "ba[ext=m4a]/ba/b" if quality == "m4a" else "ba/b"
+        opts["writethumbnail"] = True
+        postprocessors += [
+            {"key": "FFmpegExtractAudio", "preferredcodec": quality, "preferredquality": "192"},
+            {"key": "FFmpegMetadata", "add_metadata": True},
+            {"key": "EmbedThumbnail", "already_have_thumbnail": False},
+        ]
+    else:
+        res = "res" if quality == "best" else f"res:{quality}"
+        if HAS_FFMPEG:
+            # Best video + best audio, merged into an MP4. Among equal resolutions, prefer
+            # H.264 + AAC because it plays everywhere (QuickTime, phones, TVs).
+            opts["format"] = "bv*+ba/b"
+            opts["format_sort"] = [res, "vcodec:h264", "ext:mp4:m4a"]
+            opts["merge_output_format"] = "mp4"
+            postprocessors.append({"key": "FFmpegMetadata", "add_metadata": True})
+        else:
+            # Without ffmpeg, only single-file formats (usually up to 360p) can be used.
+            opts["format"] = "b"
+            opts["format_sort"] = [res, "ext:mp4"]
+    opts["postprocessors"] = postprocessors
+    return opts
+
+
+_STEPS = {
+    "Merger": "Merging video and audio",
+    "ExtractAudio": "Converting audio",
+    "FFmpegMetadata": "Adding metadata",
+    "EmbedThumbnail": "Adding cover art",
+    "MoveFiles": "Finishing up",
+}
+
+
+def download(
+    url: str,
+    quality: str = "best",
+    out_dir: Path = DEFAULT_DIR,
+    playlist: bool = False,
+    on_progress: Optional[ProgressFn] = None,
+    should_cancel: Optional[CancelFn] = None,
+) -> list[str]:
+    """Download a video (or every video in a playlist). Returns the saved file paths."""
+    if not is_valid_quality(quality):
+        raise DownloaderError(f"Unknown quality: {quality}")
+    out_dir = Path(out_dir).expanduser()
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    report = on_progress or (lambda _: None)
+    logger = _Logger()
+    files: list[str] = []
+    partials: set[str] = set()
+
+    def progress_hook(d):
+        if should_cancel and should_cancel():
+            raise DownloadCancelled()
+        info = d.get("info_dict") or {}
+        if d.get("tmpfilename"):
+            partials.add(d["tmpfilename"])
+        if d["status"] != "downloading":
+            return
+        total = d.get("total_bytes") or d.get("total_bytes_estimate")
+        done = d.get("downloaded_bytes") or 0
+        percent = done / total * 100 if total else None
+        if percent is None and d.get("fragment_count"):
+            percent = (d.get("fragment_index") or 0) / d["fragment_count"] * 100
+        if info.get("vcodec") == "none":
+            part = "audio"
+        elif info.get("acodec") == "none":
+            part = "video"
+        else:
+            part = "file"
+        report({
+            "phase": "downloading",
+            "part": part,
+            "percent": min(percent, 100) if percent is not None else None,
+            "downloaded": done,
+            "total": total,
+            "speed": d.get("speed"),
+            "eta": d.get("eta"),
+            "index": info.get("playlist_index") if playlist else None,
+            "count": (info.get("n_entries") or info.get("playlist_count")) if playlist else None,
+            "item_title": info.get("title"),
+        })
+
+    def postprocessor_hook(d):
+        name = d.get("postprocessor")
+        if d["status"] == "started" and name in _STEPS:
+            report({"phase": "processing", "step": _STEPS[name]})
+        if d["status"] == "finished" and name == "MoveFiles":
+            path = (d.get("info_dict") or {}).get("filepath")
+            if path and path not in files:
+                files.append(path)
+
+    opts = build_opts(quality, out_dir, playlist, logger)
+    opts["progress_hooks"] = [progress_hook]
+    opts["postprocessor_hooks"] = [postprocessor_hook]
+
+    cached = None if playlist else _cache_get(url)
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            result = None
+            if cached:
+                try:
+                    result = ydl.process_ie_result(cached, download=True)
+                except DownloadError:
+                    result = None  # stale lookup (e.g. expired links): fall back to a fresh one
+                    logger.errors.clear()
+            if result is None:
+                result = ydl.extract_info(url, download=True)
+    except DownloadCancelled:
+        for p in partials:
+            for leftover in (p, p + ".part", p + ".ytdl"):
+                if os.path.isfile(leftover):
+                    try:
+                        os.remove(leftover)
+                    except OSError:
+                        pass
+        raise
+    except DownloadError as e:
+        raise DownloaderError(clean_error(e)) from None
+
+    # Fall back to yt-dlp's own record of what it saved (e.g. files that already existed).
+    entries = (result or {}).get("entries") if (result or {}).get("_type") == "playlist" else [result]
+    for entry in entries or []:
+        for rd in (entry or {}).get("requested_downloads") or []:
+            path = rd.get("filepath")
+            if path and path not in files and os.path.exists(path):
+                files.append(path)
+
+    files = [f for f in files if os.path.exists(f)]
+    if not files:
+        raise DownloaderError(logger.errors[-1] if logger.errors else "Nothing was downloaded")
+    return files
+
+
+# ---------------------------------------------------------------- command line
+
+
+def _fmt_bytes(n) -> str:
+    if not n:
+        return "?"
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.1f} {unit}" if unit != "B" else f"{n} B"
+        n /= 1024
+    return f"{n:.1f} GB"
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description="Download YouTube videos or audio.")
+    parser.add_argument("url", help="video or playlist link")
+    parser.add_argument(
+        "-q", "--quality", default="best",
+        help="best (default), a resolution like 1080 / 720 / 480, or mp3 / m4a for audio only",
+    )
+    parser.add_argument("-o", "--output", default=str(DEFAULT_DIR), help=f"folder to save into (default: {DEFAULT_DIR})")
+    args = parser.parse_args(argv)
+
+    if not is_valid_quality(args.quality):
+        parser.error("quality must be best, a number like 720, mp3 or m4a")
+
+    try:
+        print("Looking up link…")
+        info = fetch_info(args.url)
+        if info["type"] == "playlist":
+            print(f"Playlist: {info['title']} ({info['count']} videos)")
+        else:
+            print(f"Video: {info['title']}")
+        print(f"Format: {quality_label(args.quality)}  →  {args.output}")
+
+        def show(p):
+            if p["phase"] == "downloading":
+                pct = p["percent"] or 0
+                bar = "█" * int(pct / 4) + "░" * (25 - int(pct / 4))
+                item = f"[{p['index']}/{p['count']}] " if p.get("index") else ""
+                speed = f"{_fmt_bytes(p['speed'])}/s" if p.get("speed") else ""
+                line = f"\r  {item}{p['part']:<5} {bar} {pct:5.1f}%  {_fmt_bytes(p['total'])}  {speed}"
+                print(f"{line:<90}", end="", flush=True)
+            else:
+                print(f"\r  {p['step']}…{'':<70}", end="", flush=True)
+
+        files = download(args.url, args.quality, Path(args.output), info["type"] == "playlist", show)
+        print()
+        for f in files:
+            print(f"Saved: {f}")
+        return 0
+    except DownloaderError as e:
+        print(f"\nError: {e}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("\nCancelled.", file=sys.stderr)
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())
