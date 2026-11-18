@@ -290,6 +290,7 @@ async function jobAction(path) {
 function overallPercent(job) {
   if (job.status === 'done') return 100;
   if (job.percent == null) return 0;
+  if (job.status === 'processing') return job.percent;
   if (job.count && job.index) return ((job.index - 1) + job.percent / 100) / job.count * 100;
   return job.percent;
 }
@@ -309,7 +310,8 @@ function statusText(job) {
       if (job.eta > 0) bits.push(`${fmtEta(job.eta)} left`);
       return bits.join(' · ') || 'Downloading…';
     }
-    case 'processing': return `${job.step || 'Processing'}…`;
+    case 'processing':
+      return `${job.step || 'Processing'}…${job.percent != null ? ` ${Math.floor(job.percent)}%` : ''}`;
     case 'done': {
       const n = job.files ? job.files.length : 1;
       return `${n > 1 ? `Saved ${n} files` : 'Saved'} · ${fmtBytes(job.size)}`;
@@ -334,8 +336,8 @@ function createJobEl(job) {
 
 function updateJobEl(el, job) {
   const bar = el.querySelector('.bar');
-  const waiting = job.status === 'queued' || job.status === 'starting' || job.status === 'processing'
-    || (job.status === 'downloading' && job.percent == null);
+  const waiting = job.status === 'queued' || job.status === 'starting'
+    || ((job.status === 'downloading' || job.status === 'processing') && job.percent == null);
   bar.classList.toggle('indeterminate', waiting);
   el.querySelector('.fill').style.width = waiting ? '' : `${overallPercent(job)}%`;
 

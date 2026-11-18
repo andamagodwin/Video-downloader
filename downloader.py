@@ -11,9 +11,11 @@ from __future__ import annotations
 
 import argparse
 import copy
+import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -32,6 +34,11 @@ DEFAULT_DIR = Path(
 AUDIO_FORMATS = ("mp3", "m4a")
 PLAYLIST_HEIGHTS = [1080, 720, 480, 360]
 HAS_FFMPEG = shutil.which("ffmpeg") is not None
+HAS_FFPROBE = shutil.which("ffprobe") is not None
+
+# Codecs that QuickTime, Finder previews, iPhones and most TVs can play.
+_PLAYABLE_VIDEO = {"h264", "hevc"}
+_PLAYABLE_AUDIO = {"aac", "mp3", "alac", "ac3", "eac3"}
 
 _ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
@@ -224,6 +231,123 @@ def _cache_get(url: str) -> Optional[dict]:
     if entry and time.time() - entry[0] < _CACHE_TTL:
         return copy.deepcopy(entry[1])  # yt-dlp modifies the dict while downloading
     return None
+
+
+# ---------------------------------------------------------------- playable output
+
+
+def _probe(path: str, timeout: float = 20) -> Optional[dict]:
+    """Read the codecs, size and length of a video file with ffprobe."""
+    if not HAS_FFPROBE:
+        return None
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-show_entries", "stream=codec_type,codec_name,width,height:format=duration",
+        "-of", "json", path,
+    ]
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        data = json.loads(out.stdout or "{}")
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return None
+    streams = data.get("streams") or []
+    if out.returncode != 0 or not streams:
+        return None
+    video = next((s for s in streams if s.get("codec_type") == "video"), None)
+    audio = next((s for s in streams if s.get("codec_type") == "audio"), None)
+    try:
+        duration = float((data.get("format") or {}).get("duration") or 0) or None
+    except ValueError:
+        duration = None
+    return {
+        "vcodec": video.get("codec_name", "unknown") if video else "none",
+        "acodec": audio.get("codec_name", "unknown") if audio else "none",
+        "width": (video or {}).get("width"),
+        "height": (video or {}).get("height"),
+        "duration": duration,
+    }
+
+
+_encoder: Optional[str] = None
+
+
+def _h264_encoder() -> Optional[str]:
+    global _encoder
+    if _encoder is None:
+        try:
+            listing = subprocess.run(
+                ["ffmpeg", "-hide_banner", "-encoders"], capture_output=True, text=True, timeout=15
+            ).stdout
+        except (OSError, subprocess.TimeoutExpired):
+            listing = ""
+        _encoder = next((e for e in ("libx264", "h264_videotoolbox") if f" {e} " in listing), "")
+    return _encoder or None
+
+
+def make_playable(path: str, report: ProgressFn, should_cancel: Optional[CancelFn] = None) -> str:
+    """Convert a video to H.264 + AAC if QuickTime can't play it (e.g. VP9 from Instagram or YouTube).
+
+    The file is replaced in place. If anything goes wrong, the original is kept, since it still
+    plays in VLC or IINA.
+    """
+    if not HAS_FFMPEG:
+        return path
+    info = _probe(path)
+    if not info or info["vcodec"] == "none":
+        return path
+    fix_video = info["vcodec"] not in _PLAYABLE_VIDEO
+    fix_audio = info["acodec"] not in _PLAYABLE_AUDIO and info["acodec"] != "none"
+    if not (fix_video or fix_audio):
+        return path
+    sides = [s for s in (info["width"], info["height"]) if s]
+    res = min(sides) if sides else 720
+    if fix_video and res > 1080:
+        return path  # 1440p and 4K only exist as VP9/AV1, and converting them would take a very long time
+
+    if fix_video:
+        encoder = _h264_encoder()
+        if not encoder:
+            return path
+        if encoder == "libx264":
+            video_args = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p"]
+        else:
+            rate = 2500 if res <= 480 else 5000 if res <= 720 else 8000
+            video_args = ["-c:v", "h264_videotoolbox", "-b:v", f"{rate}k", "-pix_fmt", "yuv420p"]
+    else:
+        video_args = ["-c:v", "copy"]
+    audio_args = ["-c:a", "aac", "-b:a", "192k"] if fix_audio else ["-c:a", "copy"]
+
+    tmp = f"{os.path.splitext(path)[0]}.converting.mp4"
+    cmd = [
+        "ffmpeg", "-y", "-nostdin", "-v", "error", "-i", path,
+        "-map", "0:v:0", "-map", "0:a?", *video_args, *audio_args,
+        "-map_metadata", "0", "-movflags", "+faststart", "-progress", "pipe:1", tmp,
+    ]
+    step = "Converting so it plays everywhere"
+    duration = info["duration"]
+    report({"phase": "processing", "step": step, "percent": 0 if duration else None})
+
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    try:
+        for line in proc.stdout:
+            if should_cancel and should_cancel():
+                raise DownloadCancelled()
+            key, _, value = line.strip().partition("=")
+            if key == "out_time_us" and value.isdigit() and duration:
+                report({"phase": "processing", "step": step, "percent": min(int(value) / 1e6 / duration * 100, 100)})
+        proc.wait()
+    except BaseException:
+        proc.kill()
+        proc.wait()
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        raise
+    if proc.returncode != 0 or not os.path.exists(tmp):
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        return path
+    os.replace(tmp, path)
+    return path
 
 
 def _thumbnail(info: dict) -> Optional[str]:
@@ -450,6 +574,9 @@ def download(
     files = [f for f in files if os.path.exists(f)]
     if not files:
         raise explain_error(logger.errors[-1] if logger.errors else "Nothing was downloaded", url, cookies_browser)
+    if quality not in AUDIO_FORMATS:
+        # Safety net: whatever the site sent, make sure the video plays in QuickTime.
+        files = [make_playable(f, report, should_cancel) for f in files]
     return files
 
 
@@ -502,7 +629,8 @@ def main(argv=None) -> int:
                 line = f"\r  {item}{p['part']:<5} {bar} {pct:5.1f}%  {_fmt_bytes(p['total'])}  {speed}"
                 print(f"{line:<90}", end="", flush=True)
             else:
-                print(f"\r  {p['step']}…{'':<70}", end="", flush=True)
+                pct = f" {p['percent']:.0f}%" if p.get("percent") is not None else ""
+                print(f"\r  {p['step']}…{pct}{'':<60}", end="", flush=True)
 
         files = download(
             args.url, args.quality, Path(args.output), info["type"] == "playlist", show, cookies_browser=browser

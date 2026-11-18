@@ -37,8 +37,11 @@ host like Vercel, every page shows a "runs on your own computer" notice instead 
 ## What it does
 
 - **Video:** every resolution the video offers, from 144p up to 4K, saved as MP4. At 1080p and below
-  the video is H.264 with AAC audio, so it plays everywhere, including QuickTime, iPhone and TVs.
-  1440p and 4K are only available as VP9/AV1, which may need VLC or IINA to play on older Macs.
+  the video is always H.264 with AAC audio, so it plays everywhere, including QuickTime, iPhone and TVs.
+  Some videos (many Instagram reels, some YouTube videos) only come as VP9, which QuickTime can't show.
+  Those are converted to H.264 automatically after downloading, and a progress bar shows while it runs.
+  1440p and 4K only exist as VP9/AV1 and aren't converted, because that would take a very long time.
+  They play in VLC or IINA.
 - **Audio only:** MP3 (192 kbps) or M4A, with title, artist and cover art embedded.
 - **Playlists:** paste a playlist link to download every video into its own folder, numbered in order.
   Private or removed videos are skipped.

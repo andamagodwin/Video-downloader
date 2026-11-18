@@ -205,7 +205,7 @@ def run_job(job_id: str):
                     step=None,
                 )
             else:
-                update(job_id, status="processing", step=p["step"])
+                update(job_id, status="processing", step=p["step"], percent=p.get("percent"))
 
         try:
             files = dl.download(
